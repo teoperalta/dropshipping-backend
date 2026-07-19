@@ -4,11 +4,14 @@ import httpx
 import os
 import httpx
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 PROVEEDOR_URL: str = "https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrder"
 PROVEEDOR_TIMEOUT: float = 10.0
 from typing import Generator, List
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import json
@@ -31,6 +34,13 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="Catálogo de Productos",
     version="2.0.0",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -298,3 +308,10 @@ async def webhook_ordenes(
         print(f"[ERROR WEBHOOK] No se pudo procesar el payload: {exc}", file=sys.stderr)
 
     return {"status": "success"}
+
+# Esta es la puerta que recibe los datos de tu botón morado
+@app.post("/webhook/ordenes")
+async def recibir_orden(orden: list):
+    print("🛒 ¡NUEVA ORDEN RECIBIDA!")
+    print(orden)
+    return {"status": "success", "message": "Orden procesada exitosamente"}
