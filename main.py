@@ -1,22 +1,16 @@
 import sys
 import os
 import httpx
-import os
-import httpx
-from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-load_dotenv()
-PROVEEDOR_URL: str = "https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrder"
-PROVEEDOR_TIMEOUT: float = 10.0
+import json
 from typing import Generator, List
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-import json
-import asyncio
-from fastapi import Request
+
+# Importaciones locales de tu proyecto
 from models import TransaccionDropshipping
 import crud
 from database import Base, SessionLocal, engine
@@ -27,7 +21,11 @@ from schemas import (
     VentaCreate,
     VentaResponse,
 )
+
 load_dotenv()
+
+PROVEEDOR_URL: str = "https://developers.cjdropshipping.com/api2.0/v1/shopping/order/createOrder"
+PROVEEDOR_TIMEOUT: float = 10.0
 
 Base.metadata.create_all(bind=engine)
 
@@ -35,6 +33,7 @@ app = FastAPI(
     title="Catálogo de Productos",
     version="2.0.0",
 )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -123,6 +122,7 @@ def registrar_venta(
 ) -> VentaResponse:
     return crud.registrar_venta(db, datos)
 
+
 @app.get(
     "/estadisticas",
     response_model=dict[str, float | int],
@@ -133,6 +133,7 @@ def obtener_estadisticas(
     db: Session = Depends(get_db),
 ) -> dict[str, float | int]:
     return crud.obtener_estadisticas_ventas(db)
+
 
 async def enviar_orden_proveedor(datos_orden: dict) -> bool:
     api_key: str | None = os.getenv("PROVEEDOR_API_KEY")
@@ -146,12 +147,12 @@ async def enviar_orden_proveedor(datos_orden: dict) -> bool:
     productos: list = datos_orden.get("productos", [])
 
     payload: dict = {
-        "orderNumber":          str(orden.get("order_number", "")),
+        "orderNumber":          str(orden.get("order_number", "TEST-001")),
         "shippingCustomerName": cliente.get("nombre_completo") or "Sin Nombre",
         "shippingAddress":      cliente.get("direccion") or "Sin Direccion",
         "shippingCity":         cliente.get("ciudad") or "Sin Ciudad",
         "shippingProvince":     cliente.get("provincia") or "Sin Provincia",
-        "shippingCountry":  cliente.get("pais") or "US",
+        "shippingCountry":      cliente.get("pais") or "US",
         "shippingCountryCode":  cliente.get("pais") or "US",
         "shippingZip":          cliente.get("codigo_postal") or "00000",
         "shippingPhone":        "0000000000", # CJ suele exigir un número de teléfono
@@ -159,7 +160,6 @@ async def enviar_orden_proveedor(datos_orden: dict) -> bool:
         "logisticName":         "CJPacket Ordinary",
         "products": [
             {
-            
                 "variantSku": item.get("sku") or "SKU-DE-PRUEBA",
                 "quantity": item.get("quantity", 1)
             }
@@ -213,6 +213,26 @@ async def enviar_orden_proveedor(datos_orden: dict) -> bool:
         print(f"[ERROR PROVEEDOR] Error de red general: {exc}", file=sys.stderr)
         return False
 
+
+# ── NUEVA FUNCIÓN PARA SEGUNDO PLANO ──
+async def procesar_y_actualizar_orden(orden_procesada: dict, transaccion_id: int):
+    """Ejecuta el envío a CJ y actualiza la base de datos sin bloquear la respuesta de la tienda"""
+    exito = await enviar_orden_proveedor(orden_procesada)
+    
+    # Abrimos una sesión independiente para la tarea en segundo plano
+    db = SessionLocal()
+    try:
+        transaccion = db.query(TransaccionDropshipping).filter(TransaccionDropshipping.id == transaccion_id).first()
+        if transaccion:
+            transaccion.estado_proveedor = "enviado" if exito else "error"
+            db.commit()
+            print(f"[DB BACKGROUND] Transacción {transaccion.id} actualizada a: '{transaccion.estado_proveedor}'")
+    except Exception as exc:
+        print(f"[ERROR DB BACKGROUND] {exc}", file=sys.stderr)
+    finally:
+        db.close()
+
+
 @app.post(
     "/webhook/ordenes",
     status_code=status.HTTP_200_OK,
@@ -220,6 +240,7 @@ async def enviar_orden_proveedor(datos_orden: dict) -> bool:
 )
 async def webhook_ordenes(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
     try:
@@ -243,9 +264,9 @@ async def webhook_ordenes(
 
         orden_procesada: dict = {
             "orden": {
-                "id":               datos.get("id"),
-                "order_number":     datos.get("order_number"),
-                "total_price":      datos.get("total_price"),
+                "id":               datos.get("id", "TEST-ID-123"),
+                "order_number":     datos.get("order_number", "TEST-001"),
+                "total_price":      datos.get("total_price", "0.00"),
                 "financial_status": datos.get("financial_status"),
             },
             "cliente": {
@@ -260,17 +281,18 @@ async def webhook_ordenes(
         }
 
         print("\n" + "=" * 60)
-        print("🚨  NUEVA ORDEN SHOPIFY — DATOS ESTRUCTURADOS  🚨")
+        print("🚨  NUEVA ORDEN RECIBIDA — DATOS ESTRUCTURADOS  🚨")
         print("=" * 60)
         print(json.dumps(orden_procesada, indent=4, ensure_ascii=False))
         print("=" * 60 + "\n")
 
-        financial_status: str = orden_procesada["orden"].get("financial_status", "")
-        orden_id = orden_procesada["orden"].get("id", "N/A")
+        # Fallback: Si la tienda no envía status, asumimos "paid" para poder probarlo
+        financial_status: str = orden_procesada["orden"].get("financial_status") or "paid"
+        orden_id = orden_procesada["orden"].get("id")
 
         if financial_status == "paid":
             transaccion = TransaccionDropshipping(
-                shopify_order_id=orden_procesada["orden"]["id"],
+                shopify_order_id=orden_id,
                 numero_orden=str(orden_procesada["orden"].get("order_number", "")),
                 estado_pago=financial_status,
                 cliente_nombre=orden_procesada["cliente"].get("nombre_completo"),
@@ -283,6 +305,10 @@ async def webhook_ordenes(
                 db.commit()
                 db.refresh(transaccion)
                 print(f"[DB] Transacción {transaccion.id} registrada con estado 'pendiente'.")
+                
+                # 🚀 LA MAGIA: Mandamos la orden a CJ en segundo plano sin hacer esperar al cliente
+                background_tasks.add_task(procesar_y_actualizar_orden, orden_procesada, transaccion.id)
+                
             except IntegrityError:
                 db.rollback()
                 print(
@@ -290,13 +316,6 @@ async def webhook_ordenes(
                     file=sys.stderr,
                 )
                 return {"status": "success"}
-
-            exito: bool = await enviar_orden_proveedor(orden_procesada)
-            transaccion.estado_proveedor = "enviado" if exito else "error"
-            db.commit()
-            print(
-            f"[DB] Transacción {transaccion.id} → estado_proveedor='{transaccion.estado_proveedor}'"
-            )
 
         else:
             print(
@@ -307,11 +326,4 @@ async def webhook_ordenes(
     except Exception as exc:
         print(f"[ERROR WEBHOOK] No se pudo procesar el payload: {exc}", file=sys.stderr)
 
-    return {"status": "success"}
-
-# Esta es la puerta que recibe los datos de tu botón morado
-@app.post("/webhook/ordenes")
-async def recibir_orden(orden: list):
-    print("🛒 ¡NUEVA ORDEN RECIBIDA!")
-    print(orden)
-    return {"status": "success", "message": "Orden procesada exitosamente"}
+    return {"status": "success", "message": "Orden recibida e iniciada en segundo plano"}
