@@ -168,7 +168,8 @@ async def enviar_orden_proveedor(datos_orden: dict) -> bool:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        timeout_config = httpx.Timeout(45.0, connect=15.0)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             
             # --- PASO 1: INTERCAMBIAR LA API KEY POR UN TOKEN TEMPORAL ---
             url_auth = "https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken"
