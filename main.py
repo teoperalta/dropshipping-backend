@@ -215,23 +215,32 @@ async def enviar_orden_proveedor(datos_orden: dict) -> bool:
         return False
 
 
-# ── NUEVA FUNCIÓN PARA SEGUNDO PLANO ──
+# ── NUEVA FUNCIÓN PARA SEGUNDO PLANO (BLINDADA) ──
 async def procesar_y_actualizar_orden(orden_procesada: dict, transaccion_id: int):
-    """Ejecuta el envío a CJ y actualiza la base de datos sin bloquear la respuesta de la tienda"""
-    exito = await enviar_orden_proveedor(orden_procesada)
-    
-    # Abrimos una sesión independiente para la tarea en segundo plano
-    db = SessionLocal()
+    """Ejecuta el envío a CJ y actualiza la base de datos sin bloquear la respuesta"""
     try:
-        transaccion = db.query(TransaccionDropshipping).filter(TransaccionDropshipping.id == transaccion_id).first()
-        if transaccion:
-            transaccion.estado_proveedor = "enviado" if exito else "error"
-            db.commit()
-            print(f"[DB BACKGROUND] Transacción {transaccion.id} actualizada a: '{transaccion.estado_proveedor}'")
-    except Exception as exc:
-        print(f"[ERROR DB BACKGROUND] {exc}", file=sys.stderr)
-    finally:
-        db.close()
+        print(f"[BACKGROUND] ⏳ Iniciando envío al proveedor para la orden {transaccion_id}...", flush=True)
+        
+        exito = await enviar_orden_proveedor(orden_procesada)
+        
+        # Abrimos una sesión independiente para la tarea en segundo plano
+        db = SessionLocal()
+        try:
+            transaccion = db.query(TransaccionDropshipping).filter(TransaccionDropshipping.id == transaccion_id).first()
+            if transaccion:
+                transaccion.estado_proveedor = "enviado" if exito else "error"
+                db.commit()
+                print(f"[DB BACKGROUND] ✅ Transacción {transaccion.id} actualizada a: '{transaccion.estado_proveedor}'", flush=True)
+        except Exception as exc:
+            print(f"[ERROR DB BACKGROUND] {exc}", file=sys.stderr)
+        finally:
+            db.close()
+            
+    except Exception as e:
+        # ¡LA TRAMPA! Si algo falla silenciosamente, esto lo obligará a salir en rojo
+        import traceback
+        print(f"[ERROR CRÍTICO BACKGROUND] La tarea falló por un error de código: {e}", file=sys.stderr)
+        traceback.print_exc()
 
 
 @app.post(
